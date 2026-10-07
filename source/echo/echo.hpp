@@ -13,7 +13,7 @@ class EchoServer {
         void OnMessage(const PtrConnection &conn, Buffer *buf) {
             conn->Send(buf->ReadPosition(), buf->ReadAbleSize());
             buf->MoveReadOffset(buf->ReadAbleSize());
-            conn->Shutdown();
+//            conn->Shutdown();
         }
     public:
         EchoServer(int port):_server(port) {
