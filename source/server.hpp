@@ -900,6 +900,8 @@ class Connection : public std::enable_shared_from_this<Connection> {
         }
         //这个接口才是实际的释放接口
         void ReleaseInLoop() {
+             // 已经清理过，避免重复关闭和重复调用关闭回调
+            if (_statu == DISCONNECTED) return;
             //1. 修改连接状态，将其置为DISCONNECTED
             _statu = DISCONNECTED;
             //2. 移除连接的事件监控
@@ -915,7 +917,9 @@ class Connection : public std::enable_shared_from_this<Connection> {
         }
         //这个接口并不是实际的发送接口，而只是把数据放到了发送缓冲区，启动了可写事件监控
         void SendInLoop(Buffer &buf) {
-            if (_statu == DISCONNECTED) return ;
+            if (_statu == DISCONNECTED) {
+                return ;
+            }
             _out_buffer.WriteBufferAndPush(buf);
             if (_channel.WriteAble() == false) {
                 _channel.EnableWrite();
@@ -923,7 +927,11 @@ class Connection : public std::enable_shared_from_this<Connection> {
         }
         //这个关闭操作并非实际的连接释放操作，需要判断还有没有数据待处理，待发送
         void ShutdownInLoop() {
-            _statu = DISCONNECTING;// 设置连接为半关闭状态
+            // 避免重复关闭，以及将已断开的连接重新标记为待关闭
+            if (_statu == DISCONNECTED || _statu == DISCONNECTING) {
+                return;
+            }
+            _statu = DISCONNECTING; // 等待待发送数据处理完毕后关闭
             if (_in_buffer.ReadAbleSize() > 0) {
                 if (_message_callback) _message_callback(shared_from_this(), &_in_buffer);
             }
@@ -999,16 +1007,24 @@ class Connection : public std::enable_shared_from_this<Connection> {
         void Send(const char *data, size_t len) {
             //外界传入的data，可能是个临时的空间，我们现在只是把发送操作压入了任务池，有可能并没有被立即执行
             //因此有可能执行的时候，data指向的空间有可能已经被释放了。
+            // 保存发送数据，避免调用者的数据提前失效
             Buffer buf;
             buf.WriteAndPush(data, len);
-            _loop->RunInLoop(std::bind(&Connection::SendInLoop, this, std::move(buf)));
+
+            // 让任务持有连接对象，保证执行期间对象仍然存在
+            auto self = shared_from_this();
+            _loop->RunInLoop(
+                std::bind(&Connection::SendInLoop, self, std::move(buf))
+            );
         }
         //提供给组件使用者的关闭接口--并不实际关闭，需要判断有没有数据待处理
         void Shutdown() {
-            _loop->RunInLoop(std::bind(&Connection::ShutdownInLoop, this));
+            auto self = shared_from_this();
+            _loop->RunInLoop(std::bind(&Connection::ShutdownInLoop, self));
         }
         void Release() {
-            _loop->QueueInLoop(std::bind(&Connection::ReleaseInLoop, this));
+            auto self = shared_from_this();
+            _loop->QueueInLoop(std::bind(&Connection::ReleaseInLoop, self));
         }
         //启动非活跃销毁，并定义多长时间无通信就是非活跃，添加定时任务
         void EnableInactiveRelease(int sec) {
