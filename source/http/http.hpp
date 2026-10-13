@@ -4,6 +4,7 @@
 #include <vector>
 #include <regex>
 #include <sys/stat.h>
+#include <limits>
 #include "../server.hpp"
 
 #define DEFALT_TIMEOUT 10
@@ -386,14 +387,39 @@ class HttpRequest {
             return it->second;
         }
         //获取正文长度
-        size_t ContentLength() const {
-            // Content-Length: 1234\r\n
-            bool ret = HasHeader("Content-Length");
-            if (ret == false) {
-                return 0;
+        bool ContentLength(size_t* length) const {
+            *length = 0;
+
+            // 当前实现：没有 Content-Length，按没有正文处理
+            if (!HasHeader("Content-Length")) {
+                return true;
             }
-            std::string clen = GetHeader("Content-Length");
-            return std::stol(clen);
+
+            std::string value = GetHeader("Content-Length");
+            if (value.empty()) {
+                return false;
+            }
+
+            size_t result = 0;
+            for (char ch : value) {
+                // 拒绝 abc、-1、14abc 等输入
+                if (ch < '0' || ch > '9') {
+                    return false;
+                }
+
+                size_t digit = static_cast<size_t>(ch - '0');
+
+                // 在乘 10、加 digit 之前检查，防止整数溢出
+                if (result >
+                    (std::numeric_limits<size_t>::max() - digit) / 10) {
+                    return false;
+                }
+
+                result = result * 10 + digit;
+            }
+
+            *length = result;
+            return true;
         }
         //判断是否是短链接
         bool Close() const {
@@ -595,7 +621,14 @@ class HttpContext {
         bool RecvHttpBody(Buffer *buf) {
             if (_recv_statu != RECV_HTTP_BODY) return false;
             //1. 获取正文长度
-            size_t content_length = _request.ContentLength();
+            size_t content_length = 0;
+
+            if (!_request.ContentLength(&content_length)) {
+                _recv_statu = RECV_HTTP_ERROR;
+                _resp_statu = 400;
+                return false;
+            }
+            
             if (content_length == 0) {
                 //没有正文，则请求接收解析完毕
                 _recv_statu = RECV_HTTP_OVER;
