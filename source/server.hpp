@@ -522,6 +522,20 @@ class TimerWheel {
                 RunTimerTask();
             }
         }
+        // 不需要刷新、不通过 ID 管理的一次性任务
+        void RunAfterInLoop(uint32_t delay, const TaskFunc &cb) {
+            // 当前时间轮有 60 个槽，只支持一圈内的延迟
+            assert(delay > 0 && delay < static_cast<uint32_t>(_capacity));
+
+            // 这里的 0 不登记到 _timers，因此不会占用任何定时器 ID
+            PtrTask task(new TimerTask(0, delay, cb));
+
+            // TimerTask 析构时一定调用 _release，需要提供有效回调
+            task->SetRelease([]() {});
+
+            int pos = (_tick + delay) % _capacity;
+            _wheel[pos].push_back(task);
+        }
         void TimerAddInLoop(uint64_t id, uint32_t delay, const TaskFunc &cb) {
             PtrTask pt(new TimerTask(id, delay, cb));
             pt->SetRelease(std::bind(&TimerWheel::RemoveTimer, this, id));
@@ -557,6 +571,7 @@ class TimerWheel {
         /*定时器中有个_timers成员，定时器信息的操作有可能在多线程中进行，因此需要考虑线程安全问题*/
         /*如果不想加锁，那就把对定期的所有操作，都放到一个线程中进行*/
         void TimerAdd(uint64_t id, uint32_t delay, const TaskFunc &cb);
+        void RunAfter(uint32_t delay, const TaskFunc &cb);//发文的时间限制
         //刷新/延迟定时任务
         void TimerRefresh(uint64_t id);
         void TimerCancel(uint64_t id);
@@ -681,6 +696,8 @@ class EventLoop {
         void TimerAdd(uint64_t id, uint32_t delay, const TaskFunc &cb) { return _timer_wheel.TimerAdd(id, delay, cb); }
         void TimerRefresh(uint64_t id) { return _timer_wheel.TimerRefresh(id); }
         void TimerCancel(uint64_t id) { return _timer_wheel.TimerCancel(id); }
+        //请求时长检查
+        void RunAfter(uint32_t delay, const TaskFunc &cb) {return _timer_wheel.RunAfter(delay, cb);}
         bool HasTimer(uint64_t id) { return _timer_wheel.HasTimer(id); }
 };
 class LoopThread {
@@ -1008,6 +1025,10 @@ class Connection : public std::enable_shared_from_this<Connection> {
         void SetClosedCallback(const ClosedCallback&cb) { _closed_callback = cb; }
         void SetAnyEventCallback(const AnyEventCallback&cb) { _event_callback = cb; }
         void SetSrvClosedCallback(const ClosedCallback&cb) { _server_closed_callback = cb; }
+        // 把延迟任务交给当前连接所属的事件循环
+        void RunAfter(uint32_t delay, const TaskFunc &cb) {
+            _loop->RunAfter(delay, cb);
+        }
         //连接建立就绪后，进行channel回调设置，启动读监控，调用_connected_callback
         void Established() {
             _loop->RunInLoop(std::bind(&Connection::EstablishedInLoop, this));
@@ -1182,4 +1203,10 @@ class NetWork {
         }
 };
 static NetWork nw;
+// 这里已经在所有类的外面
+inline void TimerWheel::RunAfter(uint32_t delay, const TaskFunc &cb) {
+    _loop->RunInLoop(
+        std::bind(&TimerWheel::RunAfterInLoop, this, delay, cb)
+    );
+}
 #endif

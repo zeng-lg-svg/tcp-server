@@ -5,6 +5,8 @@
 #include <regex>
 #include <sys/stat.h>
 #include <limits>
+#include <chrono>
+#include <memory>
 #include "../server.hpp"
 
 #define DEFALT_TIMEOUT 10
@@ -495,12 +497,26 @@ typedef enum {
     RECV_HTTP_OVER
 }HttpRecvStatu;
 
+// 每个请求单独拥有一份超时状态
+struct HttpRequestDeadline {
+    std::chrono::steady_clock::time_point expires_at;//使用 steady_clock 是因为它适合计算经过的时间，不受系统日期被调整的影响。
+    bool active;   // 是否仍需要检查超时
+    bool expired;  // 是否已经判定超时
+
+    explicit HttpRequestDeadline(int seconds)
+        : expires_at(std::chrono::steady_clock::now()
+                     + std::chrono::seconds(seconds)),
+          active(true),
+          expired(false) {}
+};
+
 #define MAX_LINE 8192
 class HttpContext {
     private:
         int _resp_statu; //响应状态码
         HttpRecvStatu _recv_statu; //当前接收及解析的阶段状态
         HttpRequest _request;  //已经解析得到的请求信息
+        std::shared_ptr<HttpRequestDeadline> _deadline;
     private:
         bool ParseHttpLine(const std::string &line) {
             std::smatch matches;
@@ -659,6 +675,8 @@ class HttpContext {
     public:
         HttpContext():_resp_statu(200), _recv_statu(RECV_HTTP_LINE) {}
         void ReSet() {
+            FinishDeadline();//超时完成
+
             _resp_statu = 200;
             _recv_statu = RECV_HTTP_LINE;
             _request.ReSet();
@@ -675,6 +693,26 @@ class HttpContext {
                 case RECV_HTTP_BODY: RecvHttpBody(buf);
             }
             return;
+        }
+
+        // 获取当前请求的超时状态
+        std::shared_ptr<HttpRequestDeadline> GetDeadline() const {
+            return _deadline;
+        }
+
+        // 只在当前请求首次收到数据时创建，后续分段不刷新期限
+        void StartDeadline(int seconds) {
+            if (!_deadline) {
+                _deadline = std::make_shared<HttpRequestDeadline>(seconds);
+            }
+        }
+
+        // 请求完成或解析失败后，让旧的超时检查失效
+        void FinishDeadline() {
+            if (_deadline) {
+                _deadline->active = false;
+                _deadline.reset();
+            }
         }
 };
 
@@ -814,6 +852,60 @@ class HttpServer {
             rsp->_statu = 405;// Method Not Allowed
             return ;
         }
+        // 返回 true：请求已超时，调用者应停止处理
+        static bool ExpireRequestIfDue(
+            const PtrConnection &conn,
+            const std::shared_ptr<HttpRequestDeadline> &deadline) {
+
+            if (deadline->expired) {
+                conn->Release();
+                        return true;
+                    }
+
+            if (!deadline->active) return false;
+
+            if (std::chrono::steady_clock::now() < deadline->expires_at) {
+                return false;
+            }
+
+            deadline->expired = true;
+            deadline->active = false;
+
+            DBG_LOG("HTTP REQUEST TIMEOUT conn=%p", (void*)conn.get());
+            conn->Release();
+            return true;
+        }
+
+        // 时间轮回调：只保存弱引用，不长期留住连接和请求状态
+        static void CheckRequestDeadline(
+            std::weak_ptr<Connection> weak_conn,
+            std::weak_ptr<HttpRequestDeadline> weak_deadline) {
+
+            auto conn = weak_conn.lock();
+            auto deadline = weak_deadline.lock();
+
+            // 连接或请求状态已经销毁
+            if (!conn || !deadline) return;
+
+            // 请求已完成，或者已经处理过超时
+            if (!deadline->active || deadline->expired) return;
+
+            // 连接已进入关闭流程，不再继续检查
+            if (!conn->Connected()) {
+                deadline->active = false;
+                return;
+            }
+
+            if (ExpireRequestIfDue(conn, deadline)) return;
+
+            // 时间轮按秒调度，可能略早触发。
+            // 截止时间尚未到，就下一秒再检查；不修改 expires_at。
+            conn->RunAfter(
+                1,
+                std::bind(&HttpServer::CheckRequestDeadline,
+                        weak_conn, weak_deadline)
+            );
+        }//这里再次检查 steady_clock，是为了避免时间轮的秒级取整让请求提前超时。再次安排检查不等于延长期限，expires_at 始终不变。
         //设置上下文
         void OnConnected(const PtrConnection &conn) {
             conn->SetContext(HttpContext());
@@ -821,38 +913,75 @@ class HttpServer {
         }
         //缓冲区数据解析+处理
         void OnMessage(const PtrConnection &conn, Buffer *buffer) {
-            while(buffer->ReadAbleSize() > 0){
-                //1. 获取上下文
-                HttpContext *context = conn->GetContext()->get<HttpContext>();
-                //2. 通过上下文对缓冲区数据进行解析，得到HttpRequest对象
-                //  1. 如果缓冲区的数据解析出错，就直接回复出错响应
-                //  2. 如果解析正常，且请求已经获取完毕，才开始去进行处理
+            // 进入关闭流程后，不再开始解析新的请求
+            if (!conn->Connected()) return;
+
+            while (buffer->ReadAbleSize() > 0) {
+                HttpContext *context =
+                    conn->GetContext()->get<HttpContext>();
+
+                // 1. 当前请求首次进入解析时，启动 15 秒接收期限
+                auto deadline = context->GetDeadline();
+
+                if (!deadline) {
+                    context->StartDeadline(15);
+                    deadline = context->GetDeadline();
+
+                    std::weak_ptr<Connection> weak_conn = conn;
+                    std::weak_ptr<HttpRequestDeadline> weak_deadline =
+                        deadline;
+
+                    conn->RunAfter(
+                        15,
+                        std::bind(&HttpServer::CheckRequestDeadline,
+                                weak_conn, weak_deadline)
+                    );
+                }
+
+                // 2. 即使定时回调尚未执行，也不能继续处理已超时的请求
+                if (ExpireRequestIfDue(conn, deadline)) return;
+
+                // 3. 解析缓冲区中的请求数据
                 context->RecvHttpRequest(buffer);
+
+                // 解析本身也可能耗时，再检查一次真实期限
+                if (ExpireRequestIfDue(conn, deadline)) return;
+
                 HttpRequest &req = context->Request();
                 HttpResponse rsp(context->RespStatu());
+
+                // 4. 解析失败：结束计时，回复错误并关闭
                 if (context->RespStatu() >= 400) {
-                    //进行错误响应，关闭连接
-                    ErrorHandler(req, &rsp);//填充一个错误显示页面数据到rsp中
-                    WriteReponse(conn, req, rsp);//组织响应发送给客户端
+                    context->FinishDeadline();
+
+                    ErrorHandler(req, &rsp);
+                    WriteReponse(conn, req, rsp);
+
                     context->ReSet();
-                    buffer->MoveReadOffset(buffer->ReadAbleSize());//出错了就把缓冲区数据清空
-                    conn->Shutdown();//关闭连接
+                    buffer->MoveReadOffset(buffer->ReadAbleSize());
+                    conn->Shutdown();
                     return;
                 }
+
+                // 5. 没收完整：保留解析状态与原来的截止时间
                 if (context->RecvStatu() != RECV_HTTP_OVER) {
-                    //当前请求还没有接收完整,则退出，等新数据到来再重新继续处理
                     return;
                 }
-                //3. 请求路由 + 业务处理
+
+                // 6. 请求接收完整，接收期限到此结束
+                context->FinishDeadline();
+
                 Route(req, &rsp);
-                //4. 对HttpResponse进行组织发送
                 WriteReponse(conn, req, rsp);
-                //5. 重置上下文
+
+                // 7. 为下一个请求清理上下文
                 context->ReSet();
-                //6. 根据长短连接判断是否关闭连接或者继续处理
-                if (rsp.Close() == true) conn->Shutdown();//短链接则直接关闭
+
+                if (rsp.Close()) {
+                    conn->Shutdown();
+                    return;
+                }
             }
-            return;
         }
     public:
         HttpServer(int port, int timeout = DEFALT_TIMEOUT):_server(port) {
