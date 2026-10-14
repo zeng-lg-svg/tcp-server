@@ -947,6 +947,8 @@ class Connection : public std::enable_shared_from_this<Connection> {
         }
         //启动非活跃连接超时释放规则
         void EnableInactiveReleaseInLoop(int sec) {
+            // 已断开的连接不再新增或刷新超时任务
+            if (_statu == DISCONNECTED) return;
             //1. 将判断标志 _enable_inactive_release 置为true
             _enable_inactive_release = true;
             //2. 如果当前定时销毁任务已经存在，那就刷新延迟一下即可
@@ -954,7 +956,14 @@ class Connection : public std::enable_shared_from_this<Connection> {
                 return _loop->TimerRefresh(_conn_id);
             }
             //3. 如果不存在定时销毁任务，则新增
-            _loop->TimerAdd(_conn_id, sec, std::bind(&Connection::Release, this));
+            // 定时器不负责长期维持连接对象的存活
+            std::weak_ptr<Connection> weak_self = shared_from_this();
+            _loop->TimerAdd(_conn_id, sec, [weak_self]() {
+                auto self = weak_self.lock();
+                if (!self) return; // 对象已经销毁
+
+                self->Release();
+            });
         }
         void CancelInactiveReleaseInLoop() {
             _enable_inactive_release = false;
@@ -1028,11 +1037,13 @@ class Connection : public std::enable_shared_from_this<Connection> {
         }
         //启动非活跃销毁，并定义多长时间无通信就是非活跃，添加定时任务
         void EnableInactiveRelease(int sec) {
-            _loop->RunInLoop(std::bind(&Connection::EnableInactiveReleaseInLoop, this, sec));
+            auto self = shared_from_this();
+            _loop->RunInLoop(std::bind(&Connection::EnableInactiveReleaseInLoop, self, sec));
         }
         //取消非活跃销毁
         void CancelInactiveRelease() {
-            _loop->RunInLoop(std::bind(&Connection::CancelInactiveReleaseInLoop, this));
+            auto self = shared_from_this();
+            _loop->RunInLoop(std::bind(&Connection::CancelInactiveReleaseInLoop, self));
         }
         //切换协议---重置上下文以及阶段性回调处理函数 -- 而是这个接口必须在EventLoop线程中立即执行
         //防备新的事件触发后，处理的时候，切换任务还没有被执行--会导致数据使用原协议处理了。
