@@ -622,6 +622,13 @@ class HttpContext {
             if (_recv_statu != RECV_HTTP_BODY) return false;
             //1. 获取正文长度
             size_t content_length = 0;
+            
+            const size_t max_body_size = 1024 * 1024;
+            if (content_length > max_body_size) {
+                _recv_statu = RECV_HTTP_ERROR;
+                _resp_statu = 413; // 请求正文过大
+                return false;
+            }
 
             if (!_request.ContentLength(&content_length)) {
                 _recv_statu = RECV_HTTP_ERROR;
