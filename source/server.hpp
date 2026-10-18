@@ -3,6 +3,7 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <cerrno>
 #include <cassert>
 #include <cstring>
 #include <ctime>
@@ -236,19 +237,35 @@ class Socket {
             return newfd;
         }
         //接收数据
+        // 本项目封装约定：
+        // >0：实际接收字节数
+        //  0：本次没有进展
+        // -1：对端结束发送，或发生致命错误
         ssize_t Recv(void *buf, size_t len, int flag = 0) {
-            // ssize_t recv(int sockfd, void *buf, size_t len, int flag);
+            // 零长度调用视为不操作，不能用它判断对端是否关闭
+            if (len == 0) return 0;
+
             ssize_t ret = recv(_sockfd, buf, len, flag);
-            if (ret <= 0) {
-                //EAGAIN 当前socket的接收缓冲区中没有数据了，在非阻塞的情况下才会有这个错误
-                //EINTR  表示当前socket的阻塞等待，被信号打断了，
-                if (errno == EAGAIN || errno == EINTR) {
-                    return 0;//表示这次接收没有接收到数据
-                }
-                ERR_LOG("SOCKET RECV FAILED!!");
+
+            if (ret > 0) {
+                return ret;
+            }
+
+            if (ret == 0) {
+                // 对端有序结束发送，不读取 errno，也不打印错误日志
                 return -1;
             }
-            return ret; //实际接收的数据长度
+
+            // 只有 ret < 0 时才根据 errno 判断错误类型
+            const int error = errno;
+            if (error == EAGAIN ||
+                error == EWOULDBLOCK ||
+                error == EINTR) {
+                return 0;
+            }
+
+            ERR_LOG("SOCKET RECV FAILED!! errno=%d", error);
+            return -1;
         }
         ssize_t NonBlockRecv(void *buf, size_t len) {
             return Recv(buf, len, MSG_DONTWAIT); // MSG_DONTWAIT 表示当前接收为非阻塞。
