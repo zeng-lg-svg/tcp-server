@@ -7,6 +7,7 @@
 #include <limits>
 #include <chrono>
 #include <memory>
+#include <cstdlib> // realpath、free
 #include "../server.hpp"
 
 #define DEFALT_TIMEOUT 10
@@ -312,16 +313,24 @@ class Util {
         // /../login, 这个路径中的..会让路径的查找跑到相对根目录之外，这是不合理的，不安全的
         static bool ValidPath(const std::string &path) {
             //思想：按照/进行路径分割，根据有多少子目录，计算目录深度，有多少层，深度不能小于0
-            std::vector<std::string> subdir;
-            Split(path, "/", &subdir);
-            int level = 0;
-            for (auto &dir : subdir) {
-                if (dir == "..") {
-                    level--; //任意一层走出相对根目录，就认为有问题
-                    if (level < 0) return false;
-                    continue;
+            if (path.empty() || path[0] != '/' ||
+                path.find('\0') != std::string::npos) {
+                return false;
+            }
+
+            std::vector<std::string> parts;
+            Split(path, "/", &parts);
+
+            size_t depth = 0;
+            for (const auto &part : parts) {
+                if (part.empty() || part == ".") continue;
+
+                if (part == "..") {
+                    if (depth == 0) return false;
+                    --depth;
+                } else {
+                    ++depth;
                 }
-                level++;
             }
             return true;
         }
@@ -774,45 +783,70 @@ class HttpServer {
             //3. 发送数据
             conn->Send(rsp_str.str().c_str(), rsp_str.str().size());
         }
-        bool IsFileHandler(const HttpRequest &req) {
-            // 1. 必须设置了静态资源根目录
-            if (_basedir.empty()) {
+        // 返回经过规范化、确认位于静态根目录内的普通文件路径
+        bool ResolveStaticPath(const std::string &request_path,
+                            std::string *resolved_path) {
+            if (_basedir.empty() || !Util::ValidPath(request_path)) {
                 return false;
             }
-            // 2. 请求方法，必须是GET / HEAD请求方法
+
+            // 获取根目录的绝对真实路径
+            char *root_ptr = ::realpath(_basedir.c_str(), nullptr);
+            if (!root_ptr) return false;
+
+            std::string root(root_ptr);
+            std::free(root_ptr);
+
+            // 带末尾 /，避免把 /wwwroot-other 误认为 /wwwroot 内部
+            std::string prefix = root;
+            if (prefix.back() != '/') prefix += '/';
+
+            std::string candidate = prefix + request_path.substr(1);
+            if (request_path.back() == '/') {
+                candidate += "index.html";
+            }
+
+            // realpath 会解析 .、.. 和符号链接；不存在的文件返回失败
+            char *file_ptr = ::realpath(candidate.c_str(), nullptr);
+            if (!file_ptr) return false;
+
+            std::string file(file_ptr);
+            std::free(file_ptr);
+
+            if (file.compare(0, prefix.size(), prefix) != 0) {
+                return false;
+            }
+
+            if (!Util::IsRegular(file)) return false;
+
+            *resolved_path = file;
+            return true;
+        }
+        bool IsFileHandler(const HttpRequest &req) {
             if (req._method != "GET" && req._method != "HEAD") {
                 return false;
             }
-            // 3. 请求的资源路径必须是一个合法路径
-            if (Util::ValidPath(req._path) == false) {
-                return false;
-            }
-            // 4. 请求的资源必须存在,且是一个普通文件
-            //    有一种请求比较特殊 -- 目录：/, /image/， 这种情况给后边默认追加一个 index.html
-            // index.html    /image/a.png
-            // 不要忘了前缀的相对根目录,也就是将请求路径转换为实际存在的路径  /image/a.png  ->   ./wwwroot/image/a.png
-            std::string req_path = _basedir + req._path;//为了避免直接修改请求的资源路径，因此定义一个临时对象
-            if (req._path.back() == '/')  {
-                req_path += "index.html";
-            }
-            if (Util::IsRegular(req_path) == false) {
-                return false;
-            }
-            return true;
+
+            std::string file;
+            return ResolveStaticPath(req._path, &file);
         }
         //静态资源的请求处理 --- 将静态资源文件的数据读取出来，放到rsp的_body中, 并设置mime
         void FileHandler(const HttpRequest &req, HttpResponse *rsp) {
-            std::string req_path = _basedir + req._path;
-            if (req._path.back() == '/')  {
-                req_path += "index.html";
-            }
-            bool ret = Util::ReadFile(req_path, &rsp->_body);
-            if (ret == false) {
+            std::string file;
+
+            // 读取前重新检查，并使用检查后返回的路径
+            if (!ResolveStaticPath(req._path, &file)) {
+                rsp->_statu = 404;
                 return;
             }
-            std::string mime = Util::ExtMime(req_path);
-            rsp->SetHeader("Content-Type", mime);
-            return;
+
+            if (!Util::ReadFile(file, &rsp->_body)) {
+                rsp->_body.clear();
+                rsp->_statu = 500;
+                return;
+            }
+
+            rsp->SetHeader("Content-Type", Util::ExtMime(file));
         }
         //功能性请求的分类处理
         void Dispatcher(HttpRequest &req, HttpResponse *rsp, Handlers &handlers) {
