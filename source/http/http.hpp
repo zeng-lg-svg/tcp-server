@@ -8,6 +8,9 @@
 #include <chrono>
 #include <memory>
 #include <cstdlib> // realpath、free
+#include <algorithm>
+#include <cctype>
+#include <sstream>
 #include "../server.hpp"
 
 #define DEFALT_TIMEOUT 10
@@ -756,32 +759,108 @@ class HttpServer {
             rsp->SetContent(body, "text/html");
         }
         //将HttpResponse中的要素按照http协议格式进行组织，发送
-        void WriteReponse(const PtrConnection &conn, const HttpRequest &req, HttpResponse &rsp) {
-            //1. 先完善头部字段
-            if (req.Close() == true) {
-                rsp.SetHeader("Connection", "close");
-            }else {
-                rsp.SetHeader("Connection", "keep-alive");
+        void WriteReponse(const PtrConnection &conn,const HttpRequest &req,HttpResponse &rsp) {
+            auto lower = [](std::string text) {
+                std::transform(
+                    text.begin(), text.end(), text.begin(),
+                    [](unsigned char ch) {
+                        return static_cast<char>(std::tolower(ch));
+                    }
+                );
+                return text;
+            };
+
+            bool close_connection = req.Close();
+            bool has_content_type = false;
+
+            // 由发送层统一组织响应边界，清理重复或冲突的头部。
+            // 当前仅支持完整缓冲正文，不支持预先编码的 chunked 正文。
+            for (auto it = rsp._headers.begin();it != rsp._headers.end();) {
+                const std::string key = lower(it->first);
+
+                if (key == "connection") {
+                    // 保留业务主动要求关闭连接的意图
+                    std::istringstream values(lower(it->second));
+                    std::string token;
+
+                    while (std::getline(values, token, ',')) {
+                        size_t first = token.find_first_not_of(" \t");
+                        if (first == std::string::npos) continue;
+
+                        size_t last = token.find_last_not_of(" \t");
+                        if (token.substr(first, last - first + 1) == "close") {
+                            close_connection = true;
+                        }
+                    }
+                }
+
+                if (key == "content-type") {
+                    has_content_type = true;
+                }
+
+                if (key == "content-length" ||
+                    key == "transfer-encoding" ||
+                    key == "trailer" ||
+                    key == "connection" ||
+                    (rsp._redirect_flag && key == "location")) {
+                    it = rsp._headers.erase(it);
+                } else {
+                    ++it;
+                }
             }
-            if (rsp._body.empty() == false && rsp.HasHeader("Content-Length") == false) {
-                rsp.SetHeader("Content-Length", std::to_string(rsp._body.size()));
+
+            rsp._headers["Connection"] =
+                close_connection ? "close" : "keep-alive";
+
+            const bool is_head = req._method == "HEAD";
+            const bool informational =
+                rsp._statu >= 100 && rsp._statu < 200;
+            const bool no_content =
+                informational || rsp._statu == 204 || rsp._statu == 304;
+            const bool reset_content = rsp._statu == 205;
+
+            if (no_content) {
+                // 1xx、204 不允许 Content-Length；
+                // 304 在这里选择省略，不从 _body 推导长度。
+            } else if (reset_content) {
+                rsp._headers["Content-Length"] = "0";
+            } else if (!is_head) {
+                rsp._headers["Content-Length"] =
+                    std::to_string(rsp._body.size());
             }
-            if (rsp._body.empty() == false && rsp.HasHeader("Content-Type") == false) {
-                rsp.SetHeader("Content-Type", "application/octet-stream");
+
+            const bool send_body =
+                !is_head && !no_content && !reset_content;
+
+            if (!has_content_type &&
+                !rsp._body.empty() &&
+                !no_content &&
+                !reset_content) {
+                rsp._headers["Content-Type"] = "application/octet-stream";
             }
-            if (rsp._redirect_flag == true) {
-                rsp.SetHeader("Location", rsp._redirect_url);
+
+            if (rsp._redirect_flag) {
+                rsp._headers["Location"] = rsp._redirect_url;
             }
-            //2. 将rsp中的要素，按照http协议格式进行组织
-            std::stringstream rsp_str;
-            rsp_str << req._version << " " << std::to_string(rsp._statu) << " " << Util::StatuDesc(rsp._statu) << "\r\n";
-            for (auto &head : rsp._headers) {
-                rsp_str << head.first << ": " << head.second << "\r\n";
+
+            std::stringstream output;
+            output << req._version << " "
+                << rsp._statu << " "
+                << Util::StatuDesc(rsp._statu) << "\r\n";
+
+            for (const auto &header : rsp._headers) {
+                output << header.first << ": "
+                    << header.second << "\r\n";
             }
-            rsp_str << "\r\n";
-            rsp_str << rsp._body;
-            //3. 发送数据
-            conn->Send(rsp_str.str().c_str(), rsp_str.str().size());
+
+            output << "\r\n";
+
+            if (send_body) {
+                output << rsp._body;
+            }
+
+            const std::string message = output.str();
+            conn->Send(message.data(), message.size());
         }
         // 返回经过规范化、确认位于静态根目录内的普通文件路径
         bool ResolveStaticPath(const std::string &request_path,
